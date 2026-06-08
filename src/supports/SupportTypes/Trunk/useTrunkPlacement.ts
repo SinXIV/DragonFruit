@@ -7,7 +7,7 @@ import { useInteractionStatus } from '../../interaction/useInteractionStatus';
 import { buildTrunkData } from './trunkBuilder';
 import { applyTrunkReplacement, computeAndApplyTrunkDiameterProfile, planTrunkReplacement } from './TrunkReplacement';
 import type { SupportData } from '../../rendering/SupportBuilder';
-import type { LimitationCode, WarningCode } from '../../types';
+import type { LimitationCode, WarningCode, Vec3 } from '../../types';
 import { calculateSmoothedNormal } from '../../PlacementLogic/PlacementUtils';
 import { getSettings } from '../../Settings';
 import { decideGridPlacement } from '../../PlacementLogic/Grid';
@@ -18,6 +18,11 @@ import { buildTwig } from '../Twig/twigBuilder';
 import { useHotkeyConfig } from '@/hotkeys/HotkeyContext';
 import { matchesConfiguredHotkeyDown, matchesConfiguredHotkeyUp } from '@/hotkeys/hotkeyConfig';
 import { getSupportPathfindingDebugEnabled, setSupportPathfindingDebugSnapshot } from '../../PlacementLogic/Pathfinding/pathfindingDebugState';
+import { getSupportWorkerRuntimeCapabilities } from '../../interaction/supportWorkerCapabilities';
+import { isSupportWorkerSafetyModeEnabled } from '../../interaction/supportWorkerSafetyMode';
+import { buildTrunkDataFromPlacement } from './trunkBuilder';
+import type { InitMeshMessage, CalculatePlacementRequestMessage, CalculatePlacementResponseMessage } from './supportPlacement.worker.shared';
+import type { SupportTipProfile } from '../../SupportPrimitives/ContactCone/types';
 
 // ---------------------------------------------------------------------------
 // Cavity stick helpers
@@ -125,6 +130,14 @@ function buildCavityStick(
 
 type CavityStickBuildResult = NonNullable<ReturnType<typeof buildCavityStick>>;
 
+function isMatrixEqual(m1: number[], m2: number[]): boolean {
+    if (m1.length !== m2.length) return false;
+    for (let i = 0; i < m1.length; i++) {
+        if (Math.abs(m1[i] - m2[i]) > 0.0001) return false;
+    }
+    return true;
+}
+
 export function useTrunkPlacementV2() {
     const HOVER_MIN_INTERVAL_MS = 9;
     const HOVER_POS_EPSILON_MM = 0.1;
@@ -155,6 +168,29 @@ export function useTrunkPlacementV2() {
         point: THREE.Vector3;
         normal: THREE.Vector3;
         atMs: number;
+    } | null>(null);
+
+    const workerCapabilities = useState(() => getSupportWorkerRuntimeCapabilities())[0];
+    const supportsWorkerSafeMode = useState(() => isSupportWorkerSafetyModeEnabled())[0];
+    
+    const workerRef = useRef<Worker | null>(null);
+    const workerFailedRef = useRef(false);
+    const nextRequestIdRef = useRef(1);
+    const latestRequestedRequestIdRef = useRef(0);
+    const latestProcessedResponseIdRef = useRef(0);
+    
+    const cancelSignalRef = useRef<SharedArrayBuffer | null>(null);
+    const cancelSignalViewRef = useRef<Int32Array | null>(null);
+    const cancelEpochRef = useRef(0);
+
+    const lastSynchronizedMeshRef = useRef<{ uuid: string; matrixWorldElements: number[] } | null>(null);
+    
+    const latestHoverRequestRef = useRef<{
+        hit: THREE.Intersection;
+        tipPos: Vec3;
+        tipNormal: Vec3;
+        modelId: string;
+        mesh: THREE.Mesh;
     } | null>(null);
 
     const clearPreview = useCallback(() => {
@@ -220,6 +256,228 @@ export function useTrunkPlacementV2() {
 
         return computed;
     }, []);
+
+    const synchronizeMesh = useCallback((mesh: THREE.Mesh, modelId: string) => {
+        const worker = workerRef.current;
+        if (!worker) return;
+
+        const matrixElements = mesh.matrixWorld.toArray();
+        
+        if (
+            lastSynchronizedMeshRef.current &&
+            lastSynchronizedMeshRef.current.uuid === mesh.uuid &&
+            isMatrixEqual(lastSynchronizedMeshRef.current.matrixWorldElements, matrixElements)
+        ) {
+            return;
+        }
+
+        try {
+            const geometry = mesh.geometry;
+            if (!geometry) return;
+
+            const positionAttr = geometry.getAttribute('position') as THREE.BufferAttribute;
+            if (!positionAttr) return;
+
+            const positionsCloned = new Float32Array(positionAttr.array);
+            const indicesCloned = geometry.index
+                ? (geometry.index.array instanceof Uint32Array
+                    ? new Uint32Array(geometry.index.array)
+                    : new Uint16Array(geometry.index.array))
+                : null;
+
+            const transferables: Transferable[] = [positionsCloned.buffer];
+            if (indicesCloned) {
+                transferables.push(indicesCloned.buffer);
+            }
+
+            const initMessage: InitMeshMessage = {
+                type: 'init_mesh',
+                modelId,
+                positions: positionsCloned,
+                indices: indicesCloned,
+                matrix: matrixElements
+            };
+
+            worker.postMessage(initMessage, transferables);
+            
+            lastSynchronizedMeshRef.current = {
+                uuid: mesh.uuid,
+                matrixWorldElements: matrixElements
+            };
+            console.log(`[useTrunkPlacement] Synchronized mesh ${mesh.uuid} / model ${modelId} to worker`);
+        } catch (err) {
+            console.error('[useTrunkPlacement] Failed to synchronize mesh to worker:', err);
+            workerFailedRef.current = true;
+            if (workerRef.current) {
+                workerRef.current.terminate();
+                workerRef.current = null;
+            }
+        }
+    }, []);
+
+    useEffect(() => {
+        if (typeof window === 'undefined' || typeof Worker === 'undefined') return;
+
+        const capabilities = workerCapabilities;
+        const safeMode = supportsWorkerSafeMode;
+
+        if (safeMode || !capabilities.hasWorker || workerFailedRef.current) {
+            if (workerRef.current) {
+                workerRef.current.terminate();
+                workerRef.current = null;
+            }
+            return;
+        }
+
+        if (!workerRef.current) {
+            try {
+                const worker = new Worker(new URL('./supportPlacement.worker.ts', import.meta.url), { type: 'module' });
+
+                if (capabilities.sharedMemoryWorkersEnabled) {
+                    const cancelSignal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+                    cancelSignalRef.current = cancelSignal;
+                    cancelSignalViewRef.current = new Int32Array(cancelSignal);
+                    Atomics.store(cancelSignalViewRef.current, 0, 0);
+                } else {
+                    cancelSignalRef.current = null;
+                    cancelSignalViewRef.current = null;
+                }
+
+                worker.onmessage = (event: MessageEvent<CalculatePlacementResponseMessage>) => {
+                    const msg = event.data;
+                    if (!msg || msg.type !== 'calculate_placement_response') return;
+
+                    if (msg.requestId < latestProcessedResponseIdRef.current) {
+                        return;
+                    }
+                    latestProcessedResponseIdRef.current = msg.requestId;
+
+                    if (msg.requestId !== latestRequestedRequestIdRef.current) {
+                        return;
+                    }
+
+                    const request = latestHoverRequestRef.current;
+                    if (!request) return;
+
+                    const { hit, tipPos, tipNormal, modelId, mesh } = request;
+                    const settings = getSettings();
+                    const placement = msg.result;
+
+                    const result = buildTrunkDataFromPlacement(
+                        { tipPos, tipNormal, modelId, mesh, isPreview: true },
+                        placement
+                    );
+
+                    const isGridMode = Boolean(settings.grid?.enabled && settings.grid.spacingMm > 0);
+                    if (!isGridMode && (result.error || result.stagnated || result.exhaustedBudget)) {
+                        if (mesh) {
+                            const cavityStick = resolveCavityStickPreview(hit, tipPos, tipNormal, modelId, mesh);
+                            if (cavityStick) {
+                                setPreviewData(cavityStick.supportData);
+                                setPreviewError(forcePlaceOverrideRef.current ? null : (cavityStick.error || null));
+                                setPreviewWarning(null);
+                                return;
+                            }
+                        }
+                        if (result.stagnated || result.exhaustedBudget) {
+                            setPreviewData(result.supportData);
+                            setPreviewError(forcePlaceOverrideRef.current ? null : (result.error || null));
+                            setPreviewWarning(null);
+                            return;
+                        }
+                    }
+
+                    const decision = decideGridPlacement({
+                        settings,
+                        snapshot: getSnapshot(),
+                        candidate: result,
+                        tipPos,
+                        tipNormal,
+                        modelId,
+                        mesh,
+                    });
+
+                    if (decision.kind === 'place_trunk') {
+                        setPreviewData(decision.trunkBuild.supportData);
+                        setPreviewError(forcePlaceOverrideRef.current ? null : (decision.trunkBuild.error || null));
+                        setPreviewWarning(decision.trunkBuild.warning || null);
+                        return;
+                    }
+
+                    if (decision.kind === 'replace_trunk') {
+                        setPreviewData(decision.trunkBuild.supportData);
+                        setPreviewError(forcePlaceOverrideRef.current ? null : (decision.trunkBuild.error || null));
+                        setPreviewWarning(decision.trunkBuild.warning || null);
+                        return;
+                    }
+
+                    if (decision.kind === 'place_branch') {
+                        setPreviewData(decision.supportData);
+                        setPreviewError(null);
+                        setPreviewWarning(null);
+                        return;
+                    }
+
+                    if (decision.kind === 'place_leaf') {
+                        setPreviewData(decision.supportData);
+                        setPreviewError(null);
+                        setPreviewWarning(null);
+                        return;
+                    }
+
+                    if (decision.kind === 'place_anchor') {
+                        setPreviewData(decision.supportData);
+                        setPreviewError(null);
+                        setPreviewWarning(null);
+                        return;
+                    }
+
+                    // reject
+                    if (decision.trunkBuild) {
+                        setPreviewData(decision.trunkBuild.supportData);
+                        setPreviewError(forcePlaceOverrideRef.current ? null : (decision.trunkBuild.error || null));
+                        setPreviewWarning(decision.trunkBuild.warning || null);
+                        return;
+                    }
+
+                    setPreviewData(null);
+                    setPreviewError(forcePlaceOverrideRef.current
+                        ? null
+                        : decision.reason === 'KNOT_ABOVE_TIP'
+                            ? 'KNOT_ABOVE_TIP'
+                            : decision.reason === 'COLLISION_WITH_MODEL'
+                                ? 'COLLISION_WITH_MODEL'
+                                : null
+                    );
+                    setPreviewWarning(null);
+                };
+
+                worker.onerror = (err) => {
+                    console.error('[SupportPlacementWorker] Worker thread error; falling back to main thread.', err);
+                    workerFailedRef.current = true;
+                    if (workerRef.current) {
+                        workerRef.current.terminate();
+                        workerRef.current = null;
+                    }
+                };
+
+                workerRef.current = worker;
+            } catch (err) {
+                console.error('[SupportPlacementWorker] Failed to initialize worker:', err);
+                workerFailedRef.current = true;
+            }
+        }
+
+        return () => {
+            if (workerRef.current) {
+                workerRef.current.terminate();
+                workerRef.current = null;
+            }
+            lastSynchronizedMeshRef.current = null;
+        };
+    }, [workerCapabilities, supportsWorkerSafeMode, resolveCavityStickPreview]);
+
+
 
     // Auto-clear preview when placement is disabled (e.g. hovering another object)
     useEffect(() => {
@@ -300,12 +558,64 @@ export function useTrunkPlacementV2() {
 
         const settings = getSettings();
         const isGridMode = Boolean(settings.grid?.enabled && settings.grid.spacingMm > 0);
-
-        // Grid mode is intentionally grid-native: build a cheap straight
-        // candidate, then let the fixed-grid resolver snap/merge/reject it.
-        // Feeding the mesh here starts the flexible A* router, which is the
-        // wrong cost model for hover on a fixed lattice.
         const mesh = hit.object instanceof THREE.Mesh ? hit.object : undefined;
+
+        // Web Worker integration
+        const canUseWorker =
+            !isGridMode &&
+            mesh &&
+            workerRef.current &&
+            !workerFailedRef.current;
+
+        if (canUseWorker) {
+            synchronizeMesh(mesh!, modelId);
+
+            latestHoverRequestRef.current = {
+                hit,
+                tipPos,
+                tipNormal,
+                modelId,
+                mesh: mesh!
+            };
+
+            cancelEpochRef.current += 1;
+            const currentEpoch = cancelEpochRef.current;
+            if (cancelSignalViewRef.current) {
+                Atomics.store(cancelSignalViewRef.current, 0, currentEpoch);
+            }
+
+            const requestId = nextRequestIdRef.current++;
+            latestRequestedRequestIdRef.current = requestId;
+
+            const tipProfile: SupportTipProfile = {
+                type: 'disk',
+                contactDiameterMm: settings.tip.contactDiameterMm,
+                bodyDiameterMm: settings.tip.bodyDiameterMm,
+                lengthMm: settings.tip.lengthMm,
+                penetrationMm: settings.tip.penetrationMm,
+                diskThicknessMm: settings.tip.diskThicknessMm ?? 0.1,
+                maxStandoffMm: settings.tip.maxStandoffMm ?? 1.5,
+                standoffAngleThreshold: settings.tip.standoffAngleThreshold ?? (Math.PI / 4),
+            };
+
+            const requestMessage: CalculatePlacementRequestMessage = {
+                type: 'calculate_placement',
+                requestId,
+                tipPos,
+                tipNormal,
+                tipProfile,
+                rootsTopZ: settings.roots.diskHeightMm + settings.roots.coneHeightMm,
+                settings,
+                isPreview: true,
+                cancelSignal: cancelSignalRef.current || undefined,
+                cancelEpoch: currentEpoch
+            };
+
+            workerRef.current!.postMessage(requestMessage);
+            return;
+        }
+
+        // Fallback synchronous path
         const result = buildTrunkData({ tipPos, tipNormal, modelId, mesh: isGridMode ? undefined : mesh, isPreview: true });
 
         // Fast-path for cavity hover when the trunk can't route to the build
@@ -396,7 +706,7 @@ export function useTrunkPlacementV2() {
                     : null
         );
         setPreviewWarning((prev) => (prev === null ? prev : null));
-    }, [HOVER_MIN_INTERVAL_MS, HOVER_NORMAL_DOT_MIN, HOVER_POS_EPSILON_MM, clearPreview, isPlacementHardDisabled, resolveCavityStickPreview]);
+    }, [HOVER_MIN_INTERVAL_MS, HOVER_NORMAL_DOT_MIN, HOVER_POS_EPSILON_MM, clearPreview, isPlacementHardDisabled, resolveCavityStickPreview, synchronizeMesh]);
 
     useEffect(() => {
         const refreshCurrentHover = () => {

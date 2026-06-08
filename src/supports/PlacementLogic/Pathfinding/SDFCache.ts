@@ -91,7 +91,7 @@ export class SDFCache {
         this.mesh = mesh;
 
         const geom = mesh.geometry as THREE.BufferGeometry & { boundsTree?: MeshBVHLike };
-        this.bvh = geom.boundsTree;
+        this.bvh = geom.boundsTree as MeshBVHLike;
         if (!this.bvh) {
             throw new Error('SDFCache: mesh geometry has no boundsTree (BVH). Ensure BVH is computed before constructing the cache.');
         }
