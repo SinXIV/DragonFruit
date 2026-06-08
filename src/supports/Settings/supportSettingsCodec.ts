@@ -65,6 +65,7 @@ function mergeWithDefaults(base?: SupportSettings): SupportSettings {
         grid: { ...defaults.grid, ...base.grid },
         meshToMesh: { ...defaults.meshToMesh, ...base.meshToMesh },
         autoBracing: { ...defaults.autoBracing, ...base.autoBracing },
+        useFlowField: base.useFlowField ?? defaults.useFlowField,
     };
 }
 

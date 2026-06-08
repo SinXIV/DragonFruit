@@ -112,6 +112,7 @@ export interface SupportSettings {
     grid: GridSettings;
     meshToMesh: MeshToMeshSettings;
     autoBracing: AutoBracingSettings;
+    useFlowField?: boolean;
 }
 
 // --- Default Factory ---
@@ -170,6 +171,7 @@ export function createDefaultSettings(): SupportSettings {
             stickVsTwigCutoffMm: DEFAULT_MESH_TO_MESH_STICK_VS_TWIG_CUTOFF_MM,
         },
         autoBracing: createDefaultAutoBracingSettings(),
+        useFlowField: false,
     };
 }
 

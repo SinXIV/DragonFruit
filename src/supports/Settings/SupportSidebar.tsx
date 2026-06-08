@@ -1208,6 +1208,32 @@ export function SupportSidebar() {
                                                     }}
                                                 />
                                             </div>
+
+                                            <div className="rounded-md border p-2 flex flex-col gap-1.5" style={SECTION_CARD_STYLE}>
+                                                <div className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: 'var(--text-muted)' }}>
+                                                    Experimental Pathfinder
+                                                </div>
+                                                <div className="flex items-center justify-between">
+                                                    <label htmlFor="flow-field-toggle" className="text-xs font-medium cursor-pointer" style={{ color: 'var(--text-strong)' }}>
+                                                        Use 3D Flow Field
+                                                    </label>
+                                                    <input
+                                                        id="flow-field-toggle"
+                                                        type="checkbox"
+                                                        checked={settings.useFlowField ?? false}
+                                                        onChange={(e) => {
+                                                            setSettings({
+                                                                ...settings,
+                                                                useFlowField: e.target.checked,
+                                                            });
+                                                        }}
+                                                        className="h-4 w-4 rounded border-gray-300 text-accent focus:ring-accent cursor-pointer"
+                                                    />
+                                                </div>
+                                                <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                                                    Enables vector-based support routing using precomputed multichannel Eikonal solvers (0.5mm - 3.0mm radius).
+                                                </div>
+                                            </div>
                                         </>
                                     ) : (
                                         <>

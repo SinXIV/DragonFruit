@@ -57,6 +57,7 @@ function mergeWithDefaults(settings: SupportSettings): SupportSettings {
         grid: mergedGrid,
         meshToMesh: { ...defaults.meshToMesh, ...(settings as any).meshToMesh },
         autoBracing: mergedAutoBracing,
+        useFlowField: coerceBoolean(settings.useFlowField, defaults.useFlowField ?? false),
     };
 }
 

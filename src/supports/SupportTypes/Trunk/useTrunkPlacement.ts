@@ -20,7 +20,8 @@ import { matchesConfiguredHotkeyDown, matchesConfiguredHotkeyUp } from '@/hotkey
 import { getSupportPathfindingDebugEnabled, setSupportPathfindingDebugSnapshot } from '../../PlacementLogic/Pathfinding/pathfindingDebugState';
 import { getSupportWorkerRuntimeCapabilities } from '../../interaction/supportWorkerCapabilities';
 import { isSupportWorkerSafetyModeEnabled } from '../../interaction/supportWorkerSafetyMode';
-import { buildTrunkDataFromPlacement } from './trunkBuilder';
+import { buildTrunkDataFromPlacement, type TrunkBuildResult } from './trunkBuilder';
+import type { TrunkPlacementResult } from '../../PlacementLogic/StandardPlacement';
 import type { InitMeshMessage, CalculatePlacementRequestMessage, CalculatePlacementResponseMessage } from './supportPlacement.worker.shared';
 import type { SupportTipProfile } from '../../SupportPrimitives/ContactCone/types';
 
@@ -193,11 +194,17 @@ export function useTrunkPlacementV2() {
         mesh: THREE.Mesh;
     } | null>(null);
 
+    const latestTrunkBuildResultRef = useRef<TrunkBuildResult | null>(null);
+    const latestPlacementResultRef = useRef<TrunkPlacementResult | null>(null);
+    const lastFlowFieldModelIdRef = useRef<string | null>(null);
+
     const clearPreview = useCallback(() => {
         setPreviewData((prev) => (prev === null ? prev : null));
         setPreviewError((prev) => (prev === null ? prev : null));
         setPreviewWarning((prev) => (prev === null ? prev : null));
         cavityPreviewCacheRef.current = null;
+        latestTrunkBuildResultRef.current = null;
+        latestPlacementResultRef.current = null;
         if (getSupportPathfindingDebugEnabled()) {
             setSupportPathfindingDebugSnapshot(null);
         }
@@ -367,6 +374,9 @@ export function useTrunkPlacementV2() {
                         { tipPos, tipNormal, modelId, mesh, isPreview: true },
                         placement
                     );
+
+                    latestTrunkBuildResultRef.current = result;
+                    latestPlacementResultRef.current = placement;
 
                     const isGridMode = Boolean(settings.grid?.enabled && settings.grid.spacingMm > 0);
                     if (!isGridMode && (result.error || result.stagnated || result.exhaustedBudget)) {
@@ -598,9 +608,18 @@ export function useTrunkPlacementV2() {
                 standoffAngleThreshold: settings.tip.standoffAngleThreshold ?? (Math.PI / 4),
             };
 
+            if (settings.useFlowField && lastFlowFieldModelIdRef.current !== modelId) {
+                workerRef.current!.postMessage({
+                    type: 'init_flow_field',
+                    modelId
+                });
+                lastFlowFieldModelIdRef.current = modelId;
+            }
+
             const requestMessage: CalculatePlacementRequestMessage = {
                 type: 'calculate_placement',
                 requestId,
+                modelId,
                 tipPos,
                 tipNormal,
                 tipProfile,
@@ -608,7 +627,8 @@ export function useTrunkPlacementV2() {
                 settings,
                 isPreview: true,
                 cancelSignal: cancelSignalRef.current || undefined,
-                cancelEpoch: currentEpoch
+                cancelEpoch: currentEpoch,
+                useFlowField: settings.useFlowField
             };
 
             workerRef.current!.postMessage(requestMessage);
@@ -770,7 +790,24 @@ export function useTrunkPlacementV2() {
         // In grid mode, avoid the flexible A* route search entirely. The grid
         // resolver owns snapping and same-node merge behavior.
         const mesh = hit.object instanceof THREE.Mesh ? hit.object : undefined;
-        const result = buildTrunkData({ tipPos, tipNormal, modelId, mesh: isGridMode ? undefined : mesh });
+        
+        let result: TrunkBuildResult;
+        if (settings.useFlowField && !isGridMode && latestPlacementResultRef.current && latestHoverRequestRef.current) {
+            const hoverReq = latestHoverRequestRef.current;
+            const distSq = new THREE.Vector3(hoverReq.tipPos.x, hoverReq.tipPos.y, hoverReq.tipPos.z).distanceToSquared(
+                new THREE.Vector3(tipPos.x, tipPos.y, tipPos.z)
+            );
+            if (hoverReq.modelId === modelId && distSq < 0.1) {
+                result = buildTrunkDataFromPlacement(
+                    { tipPos, tipNormal, modelId, mesh, isPreview: false },
+                    latestPlacementResultRef.current
+                );
+            } else {
+                result = buildTrunkData({ tipPos, tipNormal, modelId, mesh: isGridMode ? undefined : mesh });
+            }
+        } else {
+            result = buildTrunkData({ tipPos, tipNormal, modelId, mesh: isGridMode ? undefined : mesh });
+        }
 
         // When the trunk can't route to the build plate (stagnation, budget
         // exhaustion, or general collision), fall back to a cavity stick/twig

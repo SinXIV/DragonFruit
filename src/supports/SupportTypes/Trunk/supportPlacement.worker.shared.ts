@@ -10,9 +10,15 @@ export interface InitMeshMessage {
     matrix: number[]; // Flat array of 16 elements (matrixWorld)
 }
 
+export interface InitFlowFieldMessage {
+    type: 'init_flow_field';
+    modelId: string;
+}
+
 export interface CalculatePlacementRequestMessage {
     type: 'calculate_placement';
     requestId: number;
+    modelId: string;
     tipPos: Vec3;
     tipNormal: Vec3;
     tipProfile: SupportTipProfile;
@@ -21,6 +27,7 @@ export interface CalculatePlacementRequestMessage {
     isPreview?: boolean;
     cancelSignal?: SharedArrayBuffer;
     cancelEpoch?: number;
+    useFlowField?: boolean;
 }
 
 export interface CalculatePlacementResponseMessage {
@@ -34,4 +41,5 @@ export interface CalculatePlacementResponseMessage {
 
 export type SupportPlacementWorkerMessage =
     | InitMeshMessage
+    | InitFlowFieldMessage
     | CalculatePlacementRequestMessage;
